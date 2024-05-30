@@ -6,7 +6,6 @@ import (
 
 	"reflect"
 
-	"github.com/databricks/databricks-sdk-go"
 	"github.com/databricks/databricks-sdk-go/service/sharing"
 	"github.com/databricks/terraform-provider-databricks/common"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -125,8 +124,12 @@ func (si ShareInfo) shareChanges(action string) ShareUpdates {
 }
 
 func (si ShareInfo) resourceShareMap() map[string]SharedDataObject {
-	m := make(map[string]SharedDataObject, len(si.Objects))
-	for _, sdo := range si.Objects {
+	return resourceShareMapForShares(si.Objects)
+}
+
+func resourceShareMapForShares(objects []SharedDataObject) map[string]SharedDataObject {
+	m := make(map[string]SharedDataObject, len(objects))
+	for _, sdo := range objects {
 		m[sdo.Name] = sdo
 	}
 	return m
@@ -143,12 +146,10 @@ func (sdo SharedDataObject) Equal(other SharedDataObject) bool {
 	return reflect.DeepEqual(sdo, other)
 }
 
-func (beforeSi ShareInfo) Diff(afterSi ShareInfo) []ShareDataChange {
-	beforeMap := beforeSi.resourceShareMap()
-	afterMap := afterSi.resourceShareMap()
+func Diff(beforeMap map[string]SharedDataObject, afterMap map[string]SharedDataObject) []ShareDataChange {
 	changes := []ShareDataChange{}
 	// not in after so remove
-	for _, beforeSdo := range beforeSi.Objects {
+	for _, beforeSdo := range beforeMap {
 		_, exists := afterMap[beforeSdo.Name]
 		if exists {
 			continue
@@ -161,7 +162,7 @@ func (beforeSi ShareInfo) Diff(afterSi ShareInfo) []ShareDataChange {
 
 	// not in before so add
 	// if in before but diff then update
-	for _, afterSdo := range afterSi.Objects {
+	for _, afterSdo := range afterMap {
 		if afterSdo.Name == "" {
 			continue
 		}
@@ -185,48 +186,16 @@ func (beforeSi ShareInfo) Diff(afterSi ShareInfo) []ShareDataChange {
 	return changes
 }
 
-func UpdateShareMeta(ctx context.Context, d *schema.ResourceData, w *databricks.WorkspaceClient, oldShareInfo ShareInfo, newShareInfo ShareInfo) error {
-	if d.HasChange("owner") {
-		if !d.HasChangeExcept("comment") {
-			_, err := w.Shares.Update(ctx, sharing.UpdateShare{
-				Name:    newShareInfo.Name,
-				Owner:   newShareInfo.Owner,
-				Comment: oldShareInfo.Comment,
-			})
-			if err != nil {
-				return err
-			}
-		} else {
-			_, err := w.Shares.Update(ctx, sharing.UpdateShare{
-				Name:    newShareInfo.Name,
-				Owner:   newShareInfo.Owner,
-				Comment: newShareInfo.Comment,
-			})
-			if err != nil {
-				return err
-			}
-		}
-	} else if d.HasChange("comment") {
-		_, err := w.Shares.Update(ctx, sharing.UpdateShare{
-			Name:    oldShareInfo.Name,
-			Owner:   oldShareInfo.Owner,
-			Comment: newShareInfo.Comment,
-		})
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+func (beforeSi ShareInfo) Diff(afterSi ShareInfo) []ShareDataChange {
+	beforeMap := beforeSi.resourceShareMap()
+	afterMap := afterSi.resourceShareMap()
+	return Diff(beforeMap, afterMap)
 }
 
 func ResourceShare() common.Resource {
 	shareSchema := common.StructToSchema(ShareInfo{}, func(m map[string]*schema.Schema) map[string]*schema.Schema {
 		m["name"].DiffSuppressFunc = common.EqualFoldDiffSuppress
-		m["object"].Set = func(i any) int {
-			objectStruct := i.(map[string]any)
-			hashString := objectStruct["name"].(string) + objectStruct["data_object_type"].(string)
-			return schema.HashString(hashString)
-		}
+		m["object"].Set = nil
 		return m
 	})
 	return common.Resource{
@@ -270,34 +239,126 @@ func ResourceShare() common.Resource {
 			if err != nil {
 				return err
 			}
+
 			var afterSi ShareInfo
 			common.DataToStructPointer(d, shareSchema, &afterSi)
-			changes := beforeSi.Diff(afterSi)
+			// changes := beforeSi.Diff(afterSi)
 
 			w, err := c.WorkspaceClient()
 			if err != nil {
 				return err
 			}
 
-			err = UpdateShareMeta(ctx, d, w, beforeSi, afterSi)
+			// @TODO: do the rollback
+			if d.HasChanges("owner", "comment") {
+				_, err = w.Shares.Update(ctx, sharing.UpdateShare{
+					Name:    d.Get("name").(string),
+					Owner:   d.Get("owner").(string),
+					Comment: d.Get("comment").(string),
+				})
+			}
+
 			if err != nil {
 				return err
 			}
 
-			if len(changes) == 0 {
+			if !d.HasChange("object") {
 				return nil
 			}
 
+			oldObjects, newObjects := d.GetChange("object")
+			tfOldObjects := oldObjects.(*schema.Set)
+			tfNewObjects := newObjects.(*schema.Set)
+
+			objectsToRemove := tfOldObjects.Difference(tfNewObjects).List()
+			objectsToAdd := tfNewObjects.Difference(tfOldObjects).List()
+
+			apiChanges := []ShareDataChange{}
+
+			for _, raw := range objectsToRemove {
+				rawMap := raw.(map[string]interface{})
+				removal := SharedDataObject{
+					Name:           rawMap["name"].(string),
+					Comment:        rawMap["comment"].(string),
+					DataObjectType: rawMap["data_object_type"].(string),
+				}
+
+				apiChanges = append(apiChanges, ShareDataChange{
+					Action:     ShareRemove,
+					DataObject: removal,
+				})
+			}
+
+			terraformShares := d.Get("object").(*schema.Set).List()
+			for _, existingShare := range beforeSi.Objects {
+				keepShare := false
+
+				for _, rawTfShare := range terraformShares {
+					rawMap := rawTfShare.(map[string]interface{})
+					tfObject := SharedDataObject{
+						Name:           rawMap["name"].(string),
+						Comment:        rawMap["comment"].(string),
+						DataObjectType: rawMap["data_object_type"].(string),
+					}
+					if existingShare.Equal(tfObject) {
+						keepShare = true
+					}
+				}
+				if !keepShare {
+					// @TODO: do we need a clone without the computed fields?
+					apiChanges = append(apiChanges, ShareDataChange{
+						Action:     ShareRemove,
+						DataObject: existingShare,
+					})
+				}
+			}
+
+			for _, raw := range objectsToAdd {
+				rawMap := raw.(map[string]interface{})
+				updateObject := SharedDataObject{
+					Name:           rawMap["name"].(string),
+					Comment:        rawMap["comment"].(string),
+					DataObjectType: rawMap["data_object_type"].(string),
+				}
+
+				// Look at the api call back result and see if the share already exists
+				exists := false
+				for _, existingDataObject := range beforeSi.Objects {
+					// This is an exact match. What should happen when the match is partial
+					// updateObject doesn't have the SharedAs field, and thus Equal behaves differently
+					if existingDataObject.Equal(updateObject) {
+						exists = true
+						break
+					}
+				}
+
+				if !exists {
+					apiChanges = append(apiChanges, ShareDataChange{
+						Action:     ShareAdd,
+						DataObject: updateObject,
+					})
+				}
+			}
+
 			err = NewSharesAPI(ctx, c).update(d.Id(), ShareUpdates{
-				Updates: changes,
+				Updates: apiChanges,
 			})
 			if err != nil {
 				// Rollback
-				rollbackErr := UpdateShareMeta(ctx, d, w, afterSi, beforeSi)
-				if rollbackErr != nil {
-					// @TODO: just just owner update failed. could be the comment
-					return common.OwnerRollbackError(err, rollbackErr, beforeSi.Owner, afterSi.Owner)
+				if d.HasChanges("owner", "comment") {
+					oldOwner, _ := d.GetChange("owner")
+					oldComment, _ := d.GetChange("comment")
+					_, rollbackErr := w.Shares.Update(ctx, sharing.UpdateShare{
+						Name:    d.Get("name").(string),
+						Owner:   oldOwner.(string),
+						Comment: oldComment.(string),
+					})
+					if rollbackErr != nil {
+						// @TODO: just just owner update failed. could be the comment
+						return common.OwnerRollbackError(err, rollbackErr, beforeSi.Owner, afterSi.Owner)
+					}
 				}
+
 				return err
 			}
 			return nil
